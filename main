@@ -1,0 +1,557 @@
+import logging
+import os
+import pandas as pd
+import csv
+
+db_config = {
+        'user': 'j30084097_13418',
+        'password': 'pPS090207/()',
+        'host': 'srv221-h-st.jino.ru',
+        'database': 'j30084097_13418'
+    }
+
+try:
+    import mysql.connector
+except ImportError:
+    mysql = None
+
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
+
+logging.basicConfig(filename='pz.log', filemode='w', level=logging.INFO)
+
+
+class SQLTable:
+    def __init__(self, db_config, table_name, db_type='mysql'):
+        self.db_config = db_config
+        self.table_name = table_name
+        self.db_type = db_type  # 'mysql' или 'postgresql'
+        self.connection = None
+        self.cursor = None
+        self.columns = None
+
+        self.connect()
+
+    def connect(self):
+        try:
+            if self.db_type == 'mysql':
+                if mysql is None:
+                    print("Ошибка: не установлен mysql-connector-python")
+                    return
+                self.connection = mysql.connector.connect(**self.db_config)
+            else:  # postgresql
+                if psycopg2 is None:
+                    print("Ошибка: не установлен psycopg2-binary")
+                    return
+                self.connection = psycopg2.connect(**self.db_config)
+
+            self.cursor = self.connection.cursor()
+            logging.info(f"Подключился к {self.db_type}, таблица {self.table_name}")
+            self.update_columns()
+
+        except Exception as e:
+            logging.error(f"Не удалось подключиться: {e}")
+            print(f"Ошибка подключения: {e}")
+
+    def _escape_name(self, name):
+        if self.db_type == 'mysql':
+            return f"`{name}`"
+        else:
+            return f'"{name}"'
+
+    def update_columns(self):
+        try:
+            if self.db_type == 'mysql':
+                query = f"SHOW COLUMNS FROM {self._escape_name(self.table_name)}"
+                self.cursor.execute(query)
+            else:
+                query = """
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = %s
+                """
+                self.cursor.execute(query, (self.table_name,))
+
+            self.columns = [row[0] for row in self.cursor.fetchall()]
+        except Exception as e:
+            logging.error(f"Ошибка получения колонок: {e}")
+
+    # CRUD операции
+
+    def insert(self, data):
+        """Вставка строки: insert({'name': 'Alex', 'age': 20})"""
+        columns = list(data.keys())
+        values = list(data.values())
+
+        cols_str = ", ".join([self._escape_name(c) for c in columns])
+        placeholders = ", ".join(["%s"] * len(values))
+
+        query = f"INSERT INTO {self._escape_name(self.table_name)} ({cols_str}) VALUES ({placeholders})"
+
+        try:
+            self.cursor.execute(query, values)
+            self.connection.commit()
+            logging.info(f"Добавлена строка в {self.table_name}")
+            print(f"Строка добавлена")
+            return self.cursor.lastrowid
+        except Exception as e:
+            self.connection.rollback()
+            logging.error(f"Ошибка вставки: {e}")
+            print(f"Не удалось добавить: {e}")
+            return None
+
+    def update(self, data, where):
+        set_parts = [f"{self._escape_name(k)} = %s" for k in data]
+        params = list(data.values())
+
+        where_parts = []
+        for k, v in where.items():
+            if v is None:
+                where_parts.append(f"{self._escape_name(k)} IS NULL")
+            else:
+                where_parts.append(f"{self._escape_name(k)} = %s")
+                params.append(v)
+
+        query = f"""
+            UPDATE {self._escape_name(self.table_name)}
+            SET {", ".join(set_parts)}
+            WHERE {" AND ".join(where_parts)}
+        """
+
+        try:
+            self.cursor.execute(query, tuple(params))
+            self.connection.commit()
+            logging.info(f"Обновлено {self.cursor.rowcount} строк")
+            return self.cursor.rowcount
+        except Exception as e:
+            self.connection.rollback()
+            logging.error(f"Ошибка обновления: {e}")
+            return 0
+
+    def delete(self, where):
+        where_parts = []
+        params = []
+
+        for k, v in where.items():
+            if v is None:
+                where_parts.append(f"{self._escape_name(k)} IS NULL")
+            else:
+                where_parts.append(f"{self._escape_name(k)} = %s")
+                params.append(v)
+
+        query = f"DELETE FROM {self._escape_name(self.table_name)} WHERE {" AND ".join(where_parts)}"
+
+        try:
+            self.cursor.execute(query, tuple(params))
+            self.connection.commit()
+            logging.info(f"Удалено {self.cursor.rowcount} строк")
+            return self.cursor.rowcount
+        except Exception as e:
+            self.connection.rollback()
+            logging.error(f"Ошибка удаления: {e}")
+            return 0
+
+    def select(self, columns=None, where=None, order_by=None, limit=None):
+        cols = "*" if not columns else ", ".join([self._escape_name(c) for c in columns])
+        query = f"SELECT {cols} FROM {self._escape_name(self.table_name)}"
+        params = []
+
+        # Обработка условий WHERE
+        if where:
+            conditions = []
+            for key, value in where.items():
+                # Поддержка операторов: __gt, __lt, __like, __in
+                if "__" in key:
+                    col, op = key.rsplit("__", 1)
+                    col = self._escape_name(col)
+
+                    if op == "gt":
+                        conditions.append(f"{col} > %s")
+                    elif op == "gte":
+                        conditions.append(f"{col} >= %s")
+                    elif op == "lt":
+                        conditions.append(f"{col} < %s")
+                    elif op == "lte":
+                        conditions.append(f"{col} <= %s")
+                    elif op == "like":
+                        conditions.append(f"{col} LIKE %s")
+                        value = f"%{value}%"
+                    elif op == "in":
+                        placeholders = ", ".join(["%s"] * len(value))
+                        conditions.append(f"{col} IN ({placeholders})")
+                        params.extend(value)
+                        continue
+                    elif op == "isnull" and value:
+                        conditions.append(f"{col} IS NULL")
+                        continue
+                    elif op == "isnull" and not value:
+                        conditions.append(f"{col} IS NOT NULL")
+                        continue
+                else:
+                    col = self._escape_name(key)
+                    if value is None:
+                        conditions.append(f"{col} IS NULL")
+                        continue
+                    conditions.append(f"{col} = %s")
+
+                params.append(value)
+
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+
+        # Сортировка
+        if order_by:
+            if isinstance(order_by, str):
+                query += f" ORDER BY {self._escape_name(order_by)}"
+            elif isinstance(order_by, dict):
+                parts = []
+                for col, asc in order_by.items():
+                    direction = "ASC" if asc else "DESC"
+                    parts.append(f"{self._escape_name(col)} {direction}")
+                query += " ORDER BY " + ", ".join(parts)
+
+        # LIMIT
+        if limit:
+            query += f" LIMIT {int(limit)}"
+
+        try:
+            self.cursor.execute(query, tuple(params) if params else ())
+            rows = self.cursor.fetchall()
+            col_names = [desc[0] for desc in self.cursor.description]
+            return pd.DataFrame(rows, columns=col_names)
+        except Exception as e:
+            logging.error(f"Ошибка SELECT: {e}")
+            return pd.DataFrame()
+
+    # JOIN запросы
+
+    def join(self, main_table, join_table, on, join_type='INNER',
+             columns=None, where=None, order_by=None, limit=None):
+        # Преобразуем тип джойна
+        join_map = {
+            'INNER': 'INNER JOIN',
+            'LEFT': 'LEFT JOIN',
+            'RIGHT': 'RIGHT JOIN',
+            'FULL': 'FULL OUTER JOIN',
+            'CROSS': 'CROSS JOIN'
+        }
+        join_str = join_map.get(join_type.upper(), 'INNER JOIN')
+
+        cols = "*" if not columns else ", ".join([self._escape_name(c) for c in columns])
+
+        # Строим условие ON
+        on_parts = []
+        for k, v in on.items():
+            on_parts.append(
+                f"{self._escape_name(main_table)}.{self._escape_name(k)} = "
+                f"{self._escape_name(join_table)}.{self._escape_name(v)}"
+            )
+        on_clause = " AND ".join(on_parts)
+
+        query = f"""
+            SELECT {cols}
+            FROM {self._escape_name(main_table)}
+            {join_str} {self._escape_name(join_table)} ON {on_clause}
+        """
+
+        params = []
+
+        # WHERE условия
+        if where:
+            conditions = []
+            for key, value in where.items():
+                # Определяем, к какой таблице относится колонка
+                if "." in key:
+                    table, col = key.split(".", 1)
+                    col_name = f"{self._escape_name(table)}.{self._escape_name(col)}"
+                else:
+                    col_name = self._escape_name(key)
+
+                if value is None:
+                    conditions.append(f"{col_name} IS NULL")
+                else:
+                    conditions.append(f"{col_name} = %s")
+                    params.append(value)
+
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+
+        # ORDER BY
+        if order_by:
+            if isinstance(order_by, str):
+                query += f" ORDER BY {order_by}"
+            elif isinstance(order_by, dict):
+                parts = []
+                for col, asc in order_by.items():
+                    direction = "ASC" if asc else "DESC"
+                    parts.append(f"{self._escape_name(col)} {direction}")
+                query += " ORDER BY " + ", ".join(parts)
+
+        if limit:
+            query += f" LIMIT {int(limit)}"
+
+        try:
+            self.cursor.execute(query, tuple(params) if params else ())
+            rows = self.cursor.fetchall()
+            col_names = [desc[0] for desc in self.cursor.description]
+            return pd.DataFrame(rows, columns=col_names)
+        except Exception as e:
+            logging.error(f"Ошибка JOIN: {e}")
+            return pd.DataFrame()
+
+    # UNION и другие операции
+
+    def union(self, query1, params1, query2, params2, all_rows=False):
+        union_type = "UNION ALL" if all_rows else "UNION"
+        combined = f"({query1}) {union_type} ({query2})"
+
+        all_params = (params1 if params1 else []) + (params2 if params2 else [])
+
+        try:
+            self.cursor.execute(combined, tuple(all_params))
+            rows = self.cursor.fetchall()
+            col_names = [desc[0] for desc in self.cursor.description]
+            return pd.DataFrame(rows, columns=col_names)
+        except Exception as e:
+            logging.error(f"Ошибка UNION: {e}")
+            return pd.DataFrame()
+
+    def union_many(self, queries, all_rows=False):
+        union_type = "UNION ALL" if all_rows else "UNION"
+        wrapped = [f"({q})" for q, _ in queries]
+        combined = f" {union_type} ".join(wrapped)
+
+        all_params = []
+        for _, params in queries:
+            all_params.extend(params if params else [])
+
+        try:
+            self.cursor.execute(combined, tuple(all_params))
+            rows = self.cursor.fetchall()
+            col_names = [desc[0] for desc in self.cursor.description]
+            return pd.DataFrame(rows, columns=col_names)
+        except Exception as e:
+            logging.error(f"Ошибка union_many: {e}")
+            return pd.DataFrame()
+
+    def find_primary_key(self):
+        try:
+            if self.db_type == 'mysql':
+                self.cursor.execute(
+                    f"SHOW KEYS FROM {self._escape_name(self.table_name)} WHERE Key_name = 'PRIMARY'"
+                )
+                result = self.cursor.fetchone()
+                return result[4] if result else None
+            else:
+                self.cursor.execute("""
+                    SELECT a.attname
+                    FROM pg_index i
+                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                    WHERE i.indrelid = %s::regclass AND i.indisprimary
+                """, (self.table_name,))
+                result = self.cursor.fetchone()
+                return result[0] if result else None
+        except:
+            return None
+
+    def fetch_all(self, where=None):
+        return self.select(where=where)
+
+    def export_to_csv(self, filename, where=None):
+        df = self.fetch_all(where)
+        path = os.path.join(os.path.expanduser('~'), 'Downloads', f"{filename}.csv")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df.to_csv(path, index=False, encoding='utf-8-sig')
+        print(f"Экспортировано в {path}")
+        logging.info(f"Экспорт в {path}")
+
+    def create_table(self, columns, if_not_exists=True):
+        """Создание таблицы: columns = {'name': 'VARCHAR(100)', 'age': 'INT'}"""
+        col_defs = ", ".join([f"{self._escape_name(k)} {v}" for k, v in columns.items()])
+
+        if self.db_type == 'mysql':
+            pk = "`id` INT AUTO_INCREMENT PRIMARY KEY"
+        else:
+            pk = "id SERIAL PRIMARY KEY"
+
+        exists = "IF NOT EXISTS " if if_not_exists else ""
+        query = f"CREATE TABLE {exists}{self._escape_name(self.table_name)} ({pk}, {col_defs})"
+
+        try:
+            self.cursor.execute(query)
+            self.connection.commit()
+            self.update_columns()
+            print(f"Таблица {self.table_name} создана")
+            logging.info(f"Таблица {self.table_name} создана")
+        except Exception as e:
+            logging.error(f"Ошибка создания таблицы: {e}")
+            print(f"Не удалось создать таблицу: {e}")
+
+    def import_csv(self, filepath, ignore_duplicates=True):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            columns = next(reader)
+            data = [row for row in reader if len(row) == len(columns)]
+
+        placeholders = ", ".join(["%s"] * len(columns))
+        cols_str = ", ".join([self._escape_name(c) for c in columns])
+
+        query = f"INSERT INTO {self._escape_name(self.table_name)} ({cols_str}) VALUES ({placeholders})"
+        if self.db_type == 'postgresql' and ignore_duplicates:
+            query += " ON CONFLICT DO NOTHING"
+
+        try:
+            self.cursor.executemany(query, data)
+            self.connection.commit()
+            print(f"Импортировано {len(data)} строк")
+            logging.info(f"Импорт {len(data)} строк из {filepath}")
+        except Exception as e:
+            self.connection.rollback()
+            logging.error(f"Ошибка импорта: {e}")
+            print(f"Не удалось импортировать: {e}")
+
+    def drop_table(self, if_exists=True):
+        exists = "IF EXISTS " if if_exists else ""
+        query = f"DROP TABLE {exists}{self._escape_name(self.table_name)}"
+
+        try:
+            self.cursor.execute(query)
+            self.connection.commit()
+            print(f"Таблица {self.table_name} удалена")
+            logging.info(f"Таблица {self.table_name} удалена")
+        except Exception as e:
+            logging.error(f"Ошибка удаления таблицы: {e}")
+
+    def add_column(self, name, type_def):
+        query = f"ALTER TABLE {self._escape_name(self.table_name)} ADD COLUMN {self._escape_name(name)} {type_def}"
+        try:
+            self.cursor.execute(query)
+            self.connection.commit()
+            self.update_columns()
+            print(f"Колонка {name} добавлена")
+        except Exception as e:
+            logging.error(f"Ошибка добавления колонки: {e}")
+
+    def delete_column(self, name):
+        query = f"ALTER TABLE {self._escape_name(self.table_name)} DROP COLUMN {self._escape_name(name)}"
+        try:
+            self.cursor.execute(query)
+            self.connection.commit()
+            self.update_columns()
+            print(f"Колонка {name} удалена")
+        except Exception as e:
+            logging.error(f"Ошибка удаления колонки: {e}")
+
+    def structure(self):
+        try:
+            if self.db_type == 'mysql':
+                self.cursor.execute(f"DESCRIBE {self._escape_name(self.table_name)}")
+                for row in self.cursor.fetchall():
+                    print(f"{row[0]} {row[1]}")
+            else:
+                self.cursor.execute("""
+                    SELECT column_name, data_type 
+                    FROM information_schema.columns 
+                    WHERE table_name = %s
+                """, (self.table_name,))
+                for row in self.cursor.fetchall():
+                    print(f"{row[0]} {row[1]}")
+        except Exception as e:
+            logging.error(f"Ошибка получения структуры: {e}")
+
+    def close(self):
+        if self.cursor:
+            self.cursor.close()
+        if self.connection:
+            self.connection.close()
+        logging.info("Соединение закрыто")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+# Подключение к базе
+db = SQLTable(db_config, 'kair', db_type='mysql')
+
+# 1. Создаём таблицу (если её ещё нет)
+print("Создаём таблицу...")
+db.create_table({
+    'name': 'VARCHAR(50)',
+    'age': 'INT',
+    'city': 'VARCHAR(50)',
+    'status': 'VARCHAR(20)'
+})
+
+# 2. Добавляем тестовые данные
+print("Добавляем данные...")
+db.insert({'name': 'Ivan', 'age': 20, 'city': 'Moscow', 'status': 'active'})
+db.insert({'name': 'Anna', 'age': 25, 'city': 'SPB', 'status': 'active'})
+db.insert({'name': 'Petr', 'age': 18, 'city': 'Moscow', 'status': 'inactive'})
+db.insert({'name': 'Maria', 'age': 30, 'city': 'Kazan', 'status': 'active'})
+
+# 3. Проверка фильтрации
+print("\n=== Тест фильтрации ===")
+print("Все активные:")
+print(db.select(where={'status': 'active'}))
+
+print("\nВозраст больше 22, сортировка по возрасту:")
+print(db.select(where={'age__gt': 22}, order_by={'age': True}))
+
+print("\nГорода, где есть 'os' (like):")
+print(db.select(where={'city__like': 'os'}))
+
+# 4. Проверка UPDATE и DELETE
+print("\n=== Тест UPDATE и DELETE ===")
+print("Меняем город у Анны на Samara:")
+db.update({'city': 'Samara'}, where={'name': 'Anna'})
+print(db.select(where={'name': 'Anna'}))
+
+print("\nУдаляем Петра:")
+db.delete(where={'name': 'Petr'})
+print("Осталось в таблице:")
+print(db.select())
+
+# 5. Создаём вторую таблицу для JOIN
+db2 = SQLTable(db_config, 'grades', db_type='mysql')
+db2.create_table({
+    'student_name': 'VARCHAR(50)',
+    'subject': 'VARCHAR(50)',
+    'score': 'INT'
+})
+db2.insert({'student_name': 'Ivan', 'subject': 'Math', 'score': 85})
+db2.insert({'student_name': 'Anna', 'subject': 'Physics', 'score': 92})
+db2.insert({'student_name': 'Maria', 'subject': 'Math', 'score': 78})
+
+# 6. Проверка JOIN
+print("\n=== Тест JOIN ===")
+print("Соединяем kair и grades по имени:")
+join_result = db.join(
+    main_table='kair',
+    join_table='grades',
+    on={'name': 'student_name'},
+    join_type='INNER',
+    columns=['kair.name', 'kair.city', 'grades.subject', 'grades.score']
+)
+print(join_result)
+
+# 7. Проверка UNION
+print("\n=== Тест UNION ===")
+q1 = "SELECT name FROM kair"
+q2 = "SELECT student_name FROM grades"
+union_result = db.union(q1, [], q2, [], all_rows=True)
+print("Список всех имён из двух таблиц:")
+print(union_result)
+
+# 8. Проверка экспорта
+print("\n=== Тест экспорта ===")
+db.export_to_csv('test_kair_result', where={'status': 'active'})
+
+# Закрываем соединения
+db.close()
+db2.close()
+print("\nВсе тесты завершены.")
