@@ -471,13 +471,7 @@ class SQLTable:
 
 
 if __name__ == "__main__":
-    # Конфигурация БД
-    db_config = {
-        'user': 'j30084097_13418',
-        'password': 'pPS090207/()',
-        'host': 'srv221-h-st.jino.ru',
-        'database': 'j30084097_13418'
-    }
+
 
     # Подключение к базе
     db = SQLTable(db_config, 'kair', db_type='mysql')
